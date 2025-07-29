@@ -1,0 +1,4 @@
+python-dotenv==1.0.1
+modal==1.0.5
+fastapi[all]
+strands-agents

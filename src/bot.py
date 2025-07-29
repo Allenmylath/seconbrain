@@ -8,7 +8,6 @@ import asyncio
 import os
 import uuid
 from typing import Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -51,6 +50,95 @@ openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MONGODB_CONNECTION_STRING = "mongodb+srv://allengeorgemylath:Mylath%4090@cluster0.jy2twdh.mongodb.net/real_estate"
 
 
+async def send_rtvi_message(rtvi_instance, search_data: Dict[str, Any], text_query: str):
+    """Send RTVI message - async helper function."""
+    try:
+        if not rtvi_instance:
+            logger.warning("⚠️ RTVI processor not available")
+            return
+
+        if search_data.get("search_completed") and search_data.get("properties"):
+            # Create structured message for successful search
+            rtvi_message_data = {
+                "type": "property_search_results",
+                "timestamp": time.time(),
+                "search_id": str(uuid.uuid4()),
+                "query": text_query,
+                "summary": {
+                    "total_found": search_data.get("results_found", 0),
+                    "showing": len(search_data["properties"]),
+                    "execution_time": search_data.get("execution_time_seconds", 0),
+                    "search_type": search_data.get("search_type", "hybrid"),
+                },
+                "filters_applied": search_data.get("filters_applied", {}),
+                "properties": [
+                    {
+                        "id": prop["property_id"],
+                        "url": prop["url"],
+                        "images": {
+                            "primary": prop["primary_image"],
+                            "all": prop["image_urls"],
+                        },
+                        "details": {
+                            "address": prop["address"],
+                            "price": prop["price"],
+                            "currency": prop["currency"],
+                            "bedrooms": prop["bedrooms"],
+                            "bathrooms": prop["bathrooms"],
+                            "type": prop["property_type"],
+                            "description": prop["description"],
+                        },
+                        "metadata": {
+                            "search_score": prop["search_score"],
+                            "mls_genuine": prop["mls_genuine"],
+                            "status": prop["status"],
+                        },
+                    }
+                    for prop in search_data["properties"]
+                ],
+            }
+
+            # Send RTVI message with timeout to prevent blocking
+            server_message_frame = RTVIServerMessageFrame(data=rtvi_message_data)
+
+            try:
+                await asyncio.wait_for(
+                    rtvi_instance.push_frame(server_message_frame), timeout=5.0
+                )
+                logger.info(
+                    f"✅ RTVI message sent from search - {len(search_data['properties'])} properties"
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ RTVI message send timed out")
+
+        else:
+            # Send error message
+            rtvi_message_data = {
+                "type": "property_search_error",
+                "timestamp": time.time(),
+                "search_id": str(uuid.uuid4()),
+                "query": text_query,
+                "error": search_data.get("error", "No properties found"),
+            }
+
+            server_message_frame = RTVIServerMessageFrame(data=rtvi_message_data)
+            try:
+                await asyncio.wait_for(
+                    rtvi_instance.push_frame(server_message_frame), timeout=3.0
+                )
+                logger.info("✅ RTVI error message sent from search")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ RTVI error message send timed out")
+
+    except Exception as e:
+        logger.error(f"❌ Error sending RTVI message from search: {e}")
+
+
+# Global variables for RTVI injection
+global_rtvi_instance = None
+global_event_loop = None
+
+
 @tool
 def execute_hybrid_search(
     text_query: str,
@@ -67,6 +155,7 @@ def execute_hybrid_search(
     """
     Execute hybrid search combining vector similarity with traditional filters.
     Updated to match MongoDB collection structure with nested property_details.
+    Includes RTVI messaging via run_coroutine_threadsafe.
     """
 
     debug_log = []
@@ -87,20 +176,40 @@ def execute_hybrid_search(
         # ====== STEP 1: VALIDATE INPUT ======
         if not text_query or not text_query.strip():
             error_msg = "Text query is empty or None"
-            return {
+            error_result = {
                 "error": error_msg,
                 "debug_log": debug_log,
                 "failure_point": "input_validation",
             }
+            # Send RTVI error message
+            if event_loop and rtvi_instance:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        send_rtvi_message(rtvi_instance, error_result, text_query),
+                        event_loop
+                    )
+                    logger.info("🚀 RTVI error message scheduled")
+                except Exception as rtvi_error:
+                    logger.error(f"❌ Error scheduling RTVI error: {rtvi_error}")
+            return error_result
 
         # ====== STEP 2: GENERATE EMBEDDING ======
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            return {
+            error_result = {
                 "error": "OPENAI_API_KEY not found",
                 "debug_log": debug_log,
                 "failure_point": "openai_api_key",
             }
+            if event_loop and rtvi_instance:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        send_rtvi_message(rtvi_instance, error_result, text_query),
+                        event_loop
+                    )
+                except Exception:
+                    pass
+            return error_result
 
         try:
             response = openai_client.embeddings.create(
@@ -109,11 +218,20 @@ def execute_hybrid_search(
             embedding_vector = response.data[0].embedding
             log_debug(f"✅ Embedding generated. Dimensions: {len(embedding_vector)}")
         except Exception as openai_error:
-            return {
+            error_result = {
                 "error": f"OpenAI API error: {str(openai_error)}",
                 "debug_log": debug_log,
                 "failure_point": "openai_api_call",
             }
+            if event_loop and rtvi_instance:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        send_rtvi_message(rtvi_instance, error_result, text_query),
+                        event_loop
+                    )
+                except Exception:
+                    pass
+            return error_result
 
         # ====== STEP 3: MONGODB CONNECTION & SEARCH ======
         try:
@@ -203,11 +321,20 @@ def execute_hybrid_search(
             log_debug(f"Found {len(results)} results")
 
         except Exception as mongo_error:
-            return {
+            error_result = {
                 "error": f"MongoDB error: {str(mongo_error)}",
                 "debug_log": debug_log,
                 "failure_point": "mongodb_operation",
             }
+            if event_loop and rtvi_instance:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        send_rtvi_message(rtvi_instance, error_result, text_query),
+                        event_loop
+                    )
+                except Exception:
+                    pass
+            return error_result
 
         # ====== STEP 4: PROCESS RESULTS WITH CORRECT STRUCTURE ======
         formatted_results = []
@@ -260,7 +387,7 @@ def execute_hybrid_search(
         total_time = time.time() - start_time
         log_debug(f"=== HYBRID SEARCH COMPLETED SUCCESSFULLY in {total_time:.2f}s ===")
 
-        return {
+        search_result = {
             "search_completed": True,
             "search_type": "hybrid_vector_traditional",
             "query": text_query,
@@ -283,9 +410,23 @@ def execute_hybrid_search(
             "note": "Hybrid search combining semantic similarity with structured filters",
         }
 
+        # Send RTVI message from within search using run_coroutine_threadsafe
+        if event_loop and rtvi_instance:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    send_rtvi_message(rtvi_instance, search_result, text_query),
+                    event_loop
+                )
+                # Don't wait for completion - let it run in background
+                logger.info("🚀 RTVI message scheduled from search function")
+            except Exception as rtvi_error:
+                logger.error(f"❌ Error scheduling RTVI message: {rtvi_error}")
+
+        return search_result
+
     except Exception as e:
         error_msg = f"Unexpected error in hybrid search: {str(e)}"
-        return {
+        error_result = {
             "error": error_msg,
             "details": str(e),
             "query": text_query,
@@ -294,11 +435,23 @@ def execute_hybrid_search(
             "full_traceback": traceback.format_exc(),
         }
 
+        # Send RTVI error message from within search
+        if event_loop and rtvi_instance:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    send_rtvi_message(rtvi_instance, error_result, text_query),
+                    event_loop
+                )
+                logger.info("🚀 RTVI error message scheduled from search function")
+            except Exception as rtvi_error:
+                logger.error(f"❌ Error scheduling RTVI error message: {rtvi_error}")
+
+        return error_result
+
 
 class RealEstateBot:
     """
-    Real Estate Bot class with direct RTVI processing.
-    Eliminates queue management to prevent blocking and shutdown issues.
+    Real Estate Bot class with simplified Strands integration following the weather example pattern.
     """
 
     def __init__(self):
@@ -308,153 +461,91 @@ class RealEstateBot:
         self.is_running = False
         self.strands_agent = None
 
-        # Initialize Strands agent for conversational responses
+        # Initialize Strands agent for result summarization
         self._initialize_strands_agent()
 
     def _initialize_strands_agent(self):
-        """Initialize the Strands agent with MongoDB schema knowledge."""
+        """Initialize the Strands agent with execute_hybrid_search as a tool."""
         self.strands_agent = Agent(
-            system_prompt="""You are a MongoDB real estate search specialist. Your role is to execute property searches with full knowledge of the database structure and implement progressive search fallback strategies.
+            tools=[execute_hybrid_search],  # Add search as a tool
+            system_prompt="""You are a property search specialist. Your role is to:
 
-## MONGODB SCHEMA KNOWLEDGE:
-**Collection:** real_estate.properties
+1. **EXTRACT SEARCH PARAMETERS** from user queries
+2. **EXECUTE PROPERTY SEARCHES** using the execute_hybrid_search tool
+3. **SUMMARIZE RESULTS** in a conversational format for audio output
 
-**Document Structure:**
-```
-{
-  "_id": ObjectId,
-  "property_url": string,
-  "property_details": {
-    "address": string,
-    "listed_price": number,
-    "currency": string,
-    "bedrooms": string,
-    "bathrooms": string,
-    "property_type": string,
-    "mls_is_genuine": boolean,
-    "description": string
-  },
-  "embedding": [number array - 3072 dimensions],
-  "ai_analysis_raw": object,
-  "processing_info": {"status": string},
-  "images": [array of image objects],
-  "images_analyzed": array
-}
-```
+When you receive a user query about properties:
+- Analyze the query to extract relevant parameters:
+  * Location keywords (city, neighborhood, area)
+  * Price range (min_price, max_price)
+  * Bedrooms and bathrooms (as strings)
+  * Property type (house, apartment, condo, etc.)
+  * Other preferences
 
-**Search Parameters You'll Receive:**
-- text_query (REQUIRED): For vector similarity search
-- min_price, max_price: Filter property_details.listed_price
-- bedrooms: Number of bedrooms (string format)
-- bathrooms: Number of bathrooms (string format)
-- property_type: Type like "house", "apartment", "condo", etc.
-- location_keywords: Specific areas, neighborhoods, cities
-- mls_genuine: Boolean for MLS verified properties
+- Call execute_hybrid_search with appropriate parameters
+- The search will automatically update the UI with results
+- Create a natural, audio-friendly summary including:
+  * Number of properties found
+  * Key details of top 2-3 properties (address, price, bedrooms/bathrooms)
+  * Notable features or recommendations
+  * Suggestions for refining the search if needed
 
-## SEARCH EXECUTION STRATEGY:
+Keep responses conversational and suitable for text-to-speech. Avoid special characters.
 
-**INITIAL SEARCH:**
-- Use ALL provided parameters for precise matching
-- Vector search with numCandidates: min(100, limit * 10)
-- Apply all filters in $match stage
+Example: If user asks "Find me a 3 bedroom house under 500k in Toronto", extract:
+- text_query: "3 bedroom house Toronto"
+- min_price: None, max_price: 500000
+- bedrooms: "3", property_type: "house"
+- location_keywords: "Toronto"
 
-**IF NO RESULTS (results_found = 0):**
-1. **First Fallback:** Remove price constraints (keep other filters)
-2. **Second Fallback:** Remove bedrooms/bathrooms constraints  
-3. **Third Fallback:** Remove property_type constraint
-4. **Final Fallback:** Keep only text_query and location_keywords
-
-**PROGRESSIVE RELAXATION LOGIC:**
-- Execute search with current parameters
-- If results_found = 0, automatically try next relaxation level
-- Track which parameters were relaxed
-- Return information about relaxations made
-
-## RESPONSE FORMAT:
-Always return structured search results with clear indication of which parameters were used/relaxed, total results found, formatted property data with images, and user-friendly explanation of any parameter relaxations made.
-
-Your goal is to find the best possible property matches while being transparent about search parameter adjustments. Based on the search results provided, create a clear, conversational summary suitable for audio output. Focus on the most relevant details and be encouraging. Don't include special characters.""",
+Then call the tool and summarize the results naturally.""",
         )
 
     async def handle_property_search_queries(
         self,
         params: FunctionCallParams,
-        text_query: str,
-        min_price: Optional[float] = None,
-        max_price: Optional[float] = None,
-        bedrooms: Optional[str] = None,
-        bathrooms: Optional[str] = None,
-        property_type: Optional[str] = None,
-        location_keywords: Optional[str] = None,
-        mls_genuine: Optional[bool] = None,
-        limit: int = 10,
+        query: str,
     ):
-        """Handle property search with custom ThreadPoolExecutor - no queue."""
-        logger.info(
-            f"🔍 Handling search: query='{text_query}', bedrooms='{bedrooms}', type='{property_type}'"
-        )
+        """Handle property search queries with single executor call."""
+        logger.info(f"🔍 Handling property search: query='{query}'")
 
         try:
-            # Create custom executor with 4 workers
-            executor = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="real-estate-"
-            )
+            # Single executor call - Strands does everything!
+            loop = asyncio.get_event_loop()
+            
+            # Create a bound version of execute_hybrid_search with RTVI parameters
+            def execute_search_with_rtvi(*args, **kwargs):
+                # Add RTVI parameters to any search call
+                return execute_hybrid_search(
+                    *args, 
+                    event_loop=loop,
+                    rtvi_instance=self.rtvi,
+                    **kwargs
+                )
+            
+            # Temporarily replace the tool in Strands agent
+            original_tool = None
+            for i, tool_func in enumerate(self.strands_agent.tools):
+                if tool_func.__name__ == 'execute_hybrid_search':
+                    original_tool = tool_func
+                    self.strands_agent.tools[i] = execute_search_with_rtvi
+                    break
+            
+            # Single executor call - Strands extracts params, calls search, and summarizes
+            result = await loop.run_in_executor(None, self.strands_agent, query)
+            
+            # Restore original tool if needed
+            if original_tool:
+                for i, tool_func in enumerate(self.strands_agent.tools):
+                    if tool_func == execute_search_with_rtvi:
+                        self.strands_agent.tools[i] = original_tool
+                        break
+            
+            logger.info("✅ Strands agent completed search and summarization")
 
-            # Execute search in custom executor to avoid blocking
-            loop = asyncio.get_running_loop()
-            search_data = await loop.run_in_executor(
-                executor,  # Custom executor instead of None
-                execute_hybrid_search,
-                text_query,
-                min_price,
-                max_price,
-                bedrooms,
-                bathrooms,
-                property_type,
-                location_keywords,
-                mls_genuine,
-                limit,
-            )
-
-            logger.info(
-                f"✅ Search completed. Results found: {search_data.get('results_found', 0)}"
-            )
-
-            # Generate conversational response using Strands
-            if (
-                search_data.get("search_completed")
-                and search_data.get("results_found", 0) > 0
-            ):
-                properties = search_data.get("properties", [])
-                summary_prompt = f"""
-                I found {search_data.get('results_found', 0)} properties for the search "{text_query}".
-                Here are the top {len(properties)} results:
-                
-                {chr(10).join([f"Property {i+1}: {prop.get('address', 'Address not available')} - ${prop.get('price', 'Price not listed')} - {prop.get('bedrooms', 'N/A')} bedrooms, {prop.get('bathrooms', 'N/A')} bathrooms" for i, prop in enumerate(properties[:3])])}
-                
-                Create a friendly, conversational summary of these results.
-                """
-            else:
-                error_msg = search_data.get("error", "No properties found")
-                summary_prompt = f'No properties were found for the search "{text_query}". Error: {error_msg}. Provide a helpful response.'
-
-            # Generate conversational response using same custom executor
-            logger.info("🤖 Generating conversational response with Strands...")
-            result = await loop.run_in_executor(
-                executor,
-                self.strands_agent,
-                summary_prompt,  # Same custom executor
-            )
-
-            # Clean up executor when done
-            executor.shutdown(wait=False)
-
-            # Send audio response via TTS
+            # Return conversational response to LLM
             await params.result_callback(result.message)
-            logger.info("🔊 Audio response sent")
-
-            # Send RTVI message directly (no queue!)
-            await self._send_rtvi_message(search_data, text_query)
+            logger.info("🔊 Conversational response sent to LLM")
 
         except Exception as e:
             logger.error(f"❌ Error in property search handler: {e}")
@@ -465,109 +556,9 @@ Your goal is to find the best possible property matches while being transparent 
                 f"I encountered an error while searching for properties: {str(e)}"
             )
 
-            # Send error RTVI message
-            await self._send_rtvi_error_message(text_query, str(e))
-
-    async def _send_rtvi_message(self, search_data: Dict[str, Any], text_query: str):
-        """Send RTVI message directly without queue."""
-        try:
-            if not self.rtvi:
-                logger.warning("⚠️ RTVI processor not available")
-                return
-
-            if search_data.get("search_completed") and search_data.get("properties"):
-                # Create structured message for successful search
-                rtvi_message_data = {
-                    "type": "property_search_results",
-                    "timestamp": time.time(),
-                    "search_id": str(uuid.uuid4()),
-                    "query": text_query,
-                    "summary": {
-                        "total_found": search_data.get("results_found", 0),
-                        "showing": len(search_data["properties"]),
-                        "execution_time": search_data.get("execution_time_seconds", 0),
-                        "search_type": search_data.get("search_type", "hybrid"),
-                    },
-                    "filters_applied": search_data.get("filters_applied", {}),
-                    "properties": [
-                        {
-                            "id": prop["property_id"],
-                            "url": prop["url"],
-                            "images": {
-                                "primary": prop["primary_image"],
-                                "all": prop["image_urls"],
-                            },
-                            "details": {
-                                "address": prop["address"],
-                                "price": prop["price"],
-                                "currency": prop["currency"],
-                                "bedrooms": prop["bedrooms"],
-                                "bathrooms": prop["bathrooms"],
-                                "type": prop["property_type"],
-                                "description": prop["description"],
-                            },
-                            "metadata": {
-                                "search_score": prop["search_score"],
-                                "mls_genuine": prop["mls_genuine"],
-                                "status": prop["status"],
-                            },
-                        }
-                        for prop in search_data["properties"]
-                    ],
-                }
-
-                # Send RTVI message with timeout to prevent blocking
-                server_message_frame = RTVIServerMessageFrame(data=rtvi_message_data)
-
-                # Add timeout to prevent RTVI blocking
-                try:
-                    await asyncio.wait_for(
-                        self.rtvi.push_frame(server_message_frame), timeout=5.0
-                    )
-                    logger.info(
-                        f"✅ RTVI message sent directly - {len(search_data['properties'])} properties"
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ RTVI message send timed out")
-
-            else:
-                logger.warning("⚠️ No valid search results to send via RTVI")
-
-        except Exception as e:
-            logger.error(f"❌ Error sending RTVI message: {e}")
-            # Don't re-raise - we don't want RTVI errors to crash the search
-
-    async def _send_rtvi_error_message(self, text_query: str, error_message: str):
-        """Send RTVI error message directly."""
-        try:
-            if not self.rtvi:
-                return
-
-            rtvi_message_data = {
-                "type": "property_search_error",
-                "timestamp": time.time(),
-                "search_id": str(uuid.uuid4()),
-                "query": text_query,
-                "error": error_message,
-            }
-
-            server_message_frame = RTVIServerMessageFrame(data=rtvi_message_data)
-
-            # Add timeout for error messages too
-            try:
-                await asyncio.wait_for(
-                    self.rtvi.push_frame(server_message_frame), timeout=3.0
-                )
-                logger.info("✅ RTVI error message sent directly")
-            except asyncio.TimeoutError:
-                logger.warning("⚠️ RTVI error message send timed out")
-
-        except Exception as e:
-            logger.error(f"❌ Error sending RTVI error message: {e}")
-
     async def start(self, room_url: str, token: str):
-        """Start the bot with direct RTVI processing."""
-        logger.info("🚀 Starting real estate search bot with direct RTVI messaging...")
+        """Start the bot following the weather example pattern."""
+        logger.info("🚀 Starting real estate search bot...")
 
         # Set running state
         self.is_running = True
@@ -580,7 +571,7 @@ Your goal is to find the best possible property matches while being transparent 
 
         llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-        # Register the bound method as a function
+        # Register the property search handler (like weather example)
         llm.register_direct_function(self.handle_property_search_queries)
 
         @llm.event_handler("on_function_calls_started")
@@ -594,44 +585,13 @@ Your goal is to find the best possible property matches while being transparent 
         messages = [
             {
                 "role": "system",
-                "content": """You are a helpful real estate assistant in a WebRTC call. Your primary role is to:
+                "content": """You are a helpful real estate assistant in a WebRTC call. Your goal is to help users find properties.
 
-1. **ANALYZE USER QUERIES** and extract optimal search parameters for property searches
-2. **UNDERSTAND CONVERSATION CONTEXT** to infer unstated user preferences  
-3. **PROVIDE CONVERSATIONAL RESPONSES** while your output will be converted to audio
+When users ask about finding properties, call the handle_property_search_queries function with their query.
 
-## SEARCH PARAMETER EXTRACTION:
-When users ask about properties, extract these parameters from their query and conversation history:
+Your responses should be natural and conversational since they will be converted to audio. Avoid special characters in your answers.
 
-**REQUIRED:**
-- text_query: The semantic search text (always required)
-
-**OPTIONAL FILTERS:**
-- min_price, max_price: Price range in numbers
-- bedrooms: Number of bedrooms (string format)
-- bathrooms: Number of bathrooms (string format)
-- property_type: Type like "house", "apartment", "condo", etc.
-- location_keywords: Specific areas, neighborhoods, cities
-- mls_genuine: Boolean for MLS verified properties
-
-**CONTEXT ANALYSIS:**
-- Track user preferences mentioned earlier in conversation
-- Infer missing parameters from context (e.g., if user mentioned budget before)
-- Consider family size hints for bedroom/bathroom needs
-- Remember location preferences from previous queries
-
-**PROGRESSIVE SEARCH STRATEGY:**
-- Start with specific parameters extracted from query
-- If no results, prepare fallback parameters (fewer filters)
-- Always prioritize user's explicit requirements
-
-## RESPONSE STYLE:
-- Conversational and audio-friendly (no special characters)
-- Help users refine their search criteria
-- Suggest specific features to search for
-- When calling search function, pass ALL extracted parameters clearly
-
-Start by suggesting users ask about finding houses with specific features or locations.""",
+Start by suggesting that users ask about finding properties with specific features or in specific locations.""",
             },
         ]
 
@@ -647,13 +607,12 @@ Start by suggesting users ask about finding houses with specific features or loc
                 audio_out_enabled=True,
                 audio_in_enabled=True,
                 vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
-                # transcription_enabled=True,
             ),
         )
 
         # Create RTVI processor and store as instance variable
         self.rtvi = RTVIProcessor(config=RTVIConfig(config=[]), transport=transport)
-        rtvi = self.rtvi  # Keep local variable for compatibility
+        rtvi = self.rtvi
 
         rtvi_observer = RTVIObserver(
             rtvi,
@@ -672,7 +631,7 @@ Start by suggesting users ask about finding houses with specific features or loc
             [
                 transport.input(),
                 stt,
-                rtvi,  # Add RTVI processor early in pipeline
+                rtvi,
                 context_aggregator.user(),
                 llm,
                 tts,
@@ -694,12 +653,10 @@ Start by suggesting users ask about finding houses with specific features or loc
         @rtvi.event_handler("on_client_ready")
         async def on_client_ready(rtvi):
             await rtvi.set_bot_ready()
-            # Kick off the conversation
             await self.task.queue_frames(
                 [context_aggregator.user().get_context_frame()]
             )
 
-        # Event handlers with better error handling
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, participant):
             try:
@@ -716,13 +673,10 @@ Start by suggesting users ask about finding houses with specific features or loc
                 logger.info(
                     f"👋 Client disconnected: {participant.get('info', {}).get('userName', 'Unknown')}"
                 )
-                # Don't auto-stop on client disconnect - let multiple users connect
-                # await self.stop()
             except Exception as e:
                 logger.error(f"❌ Error in client disconnected handler: {e}")
 
-            # Run the pipeline
-
+        # Run the pipeline
         runner = PipelineRunner()
         await runner.run(self.task)
 
@@ -730,7 +684,7 @@ Start by suggesting users ask about finding houses with specific features or loc
 async def run_bot(room_url: str, token: str):
     """
     Main function that runs the real estate search bot.
-    Now uses direct RTVI processing without queue management.
+    Following the weather example pattern with RTVI integration.
     """
     bot = RealEstateBot()
     try:
